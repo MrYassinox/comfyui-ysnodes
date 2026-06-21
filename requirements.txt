@@ -1,0 +1,5 @@
+# comfyui-ysnodes requirements
+# This package has zero external dependencies beyond ComfyUI core
+# (uses only: comfy, torch, Python standard library)
+
+# No additional pip packages required
