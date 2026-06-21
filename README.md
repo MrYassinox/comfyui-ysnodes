@@ -1,6 +1,6 @@
 # comfyui-ysnodes
 
-A personal pack of custom ComfyUI nodes — Every node is self-contained with zero dependency on external custom node packs.
+A lightweight ComfyUI custom node pack — Every node is self-contained with zero dependency on external custom node packs.
 
 > **Author:** Mr. Yassin NM (Mr. Yassinox)  
 > **License:** MIT
