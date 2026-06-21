@@ -335,14 +335,14 @@ The `__init__.py` scans `nodes/` on startup and imports every `.py` file automat
 
 ## 📝 Changelog
 
-### v1.1.0 — Apr 2025
+### v1.1.0
 
 - **BREAKING:** `Size Picker` — replaced 35 fixed resolution presets with dynamic aspect-ratio + megapixel + multiple system (17 aspect ratios)
 - **BREAKING:** `Size Picker Full` — same dynamic sizing as Size Picker, with `latent_empty` and `latent_from_image` outputs
 - **NEW:** `Reference Conditioning` — attaches reference image latent to conditioning (Flux Kontext-style)
 - **Updated:** README fully rewritten with per-node I/O tables, presets, and credits
 
-### v1.0.0 — Mar 2025
+### v1.0.0
 
 - Initial release with 7 nodes:
   - Sigma Generator
