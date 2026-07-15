@@ -3,7 +3,7 @@ comfyui-ysnodes
 ===============
 A personal pack of custom ComfyUI nodes by Mr. Yassin NM.
 
-Version: 1.0.0
+Version: 1.2.0
 
 Adding a new node
 -----------------
@@ -23,7 +23,7 @@ and registered via the WEB_DIRECTORY variable below.
 import os
 import importlib
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 NODE_CLASS_MAPPINGS: dict = {}
 NODE_DISPLAY_NAME_MAPPINGS: dict = {}
