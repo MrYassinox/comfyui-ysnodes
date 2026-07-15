@@ -1,8 +1,8 @@
 """
-nodes/image_scale_total_pixels.py
-======================================
-ImageScaleToTotalPixels
-— converted and improved from the "ImageScaleToTotalPixels".
+nodes/image_scale_to_norm_pixels.py
+=========================================
+ImageScaleToNormPixels
+— duplicated from ImageScaleTotalPixels, with VAE encoding removed.
 
 Pipeline (two sequential steps, both optional independently)
 ----------------------------------------------------------------
@@ -19,28 +19,17 @@ Pipeline (two sequential steps, both optional independently)
   same scale_by / megapixels / multiple values, so image and mask always
   end up at matching dimensions.
 
-  VAE encode path (if vae connected):
-    VAEEncode(final_image, vae)  → latent_image
-    VAEEncode(final_mask_as_image, vae) → latent_mask  (if mask connected)
+Difference from ImageScaleTotalPixels
+------------------------------------------
+  • No vae input
+  • No latent_image / latent_mask outputs
+  • Outputs are just: image, mask
 
 Fallbacks
 ---------
-  vae  not connected → latent_image / latent_mask = zeros
-  mask not connected → mask / latent_mask          = zeros
+  mask not connected → mask output = zeros
 
-Improvements over the original
------------------------------------------
-  • Single node replaces 7 (2× ImageScaleToTotalPixels, 2× VAEEncode,
-    MaskToImage, ImageToMask, 2× Switch)
-  • scale_by input — simple size multiplier, applied before the
-    megapixels constraint (matches ImageScaleToNormPixels behaviour
-    when enable_megapixels=False)
-  • multiple input — controls the rounding step for both scale_by and
-    megapixels, instead of a hardcoded 8
-  • mask and vae are optional
-  • Lowercase output names
-  • Clear tooltips on all inputs
-  • Zero external dependencies
+Zero external dependencies.
 """
 
 import math
@@ -115,21 +104,6 @@ def _image_to_mask(image: torch.Tensor) -> torch.Tensor:
     return image[..., 0]
 
 
-def _vae_encode(vae, image: torch.Tensor) -> dict:
-    """Encode image with VAE — mirrors VAEEncode core node."""
-    samples = vae.encode(image[:, :, :, :3])
-    return {"samples": samples}
-
-
-def _empty_latent(image: torch.Tensor) -> dict:
-    """Return a zero latent matching the spatial size of image (B,H,W,C)."""
-    _, h, w, _ = image.shape
-    samples = torch.zeros(
-        [image.shape[0], 4, h // 8, w // 8], dtype=torch.float32
-    )
-    return {"samples": samples}
-
-
 def _empty_mask(image: torch.Tensor) -> torch.Tensor:
     """Return a zero mask matching the spatial size of image (B,H,W,C)."""
     _, h, w, _ = image.shape
@@ -160,12 +134,12 @@ def _apply_scale_steps(image: torch.Tensor, scale_by: float, megapixels: float,
 # Node class
 # ---------------------------------------------------------------------------
 
-class ImageScaleTotalPixels:
+class ImageScaleToNormPixels:
     """
-    ImageScaleToTotalPixels
+    ImageScaleToNormPixels
 
     Two independent, stackable scaling steps applied to an image (and
-    optionally a mask), then both are optionally VAE-encoded:
+    optionally a mask):
 
       1. scale_by   — simple size multiplier (1.0 = unchanged, 1.5 = 50% bigger)
       2. megapixels — constrains the result to a target megapixel count,
@@ -173,18 +147,18 @@ class ImageScaleTotalPixels:
 
     scale_by=1.0 and enable_megapixels=False together reproduce the
     original input completely unchanged. scale_by alone (with
-    enable_megapixels=False) behaves like ImageScaleToNormPixels.
+    enable_megapixels=False) behaves exactly like the standalone
+    ImageScaleToNormPixels node.
 
-    Optional inputs:
-      mask → MASK and LATENT_MASK return zeros when not connected
-      vae  → LATENT_IMAGE and LATENT_MASK return zeros when not connected
+    No VAE encoding — outputs are just image and mask.
+    mask is optional — returns zeros when not connected.
     """
 
     CATEGORY = "YSNodes/image"
     FUNCTION = "run"
 
-    RETURN_TYPES  = ("IMAGE",  "LATENT",        "MASK",  "LATENT")
-    RETURN_NAMES  = ("image",  "latent_image",  "mask",  "latent_mask")
+    RETURN_TYPES  = ("IMAGE",  "MASK")
+    RETURN_NAMES  = ("image",  "mask")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -248,12 +222,6 @@ class ImageScaleTotalPixels:
                         "steps as the image. Returns zeros when not connected."
                     ),
                 }),
-                "vae": ("VAE", {
-                    "tooltip": (
-                        "Optional VAE model for encoding outputs to latent space. "
-                        "latent_image and latent_mask return zeros when not connected."
-                    ),
-                }),
             },
         }
 
@@ -267,7 +235,6 @@ class ImageScaleTotalPixels:
         multiple: int,
         enable_megapixels: bool,
         mask=None,
-        vae=None,
     ):
         # ── Step 1+2: scale_by then megapixels (image) ──────────────────
         image_out = _apply_scale_steps(
@@ -284,20 +251,7 @@ class ImageScaleTotalPixels:
         else:
             mask_out = _empty_mask(image_out)
 
-        # ── Step 3: VAE encode (if connected) ────────────────────────────
-        if vae is not None:
-            latent_image = _vae_encode(vae, image_out)
-
-            if mask is not None:
-                mask_as_img = _mask_to_image(mask_out)
-                latent_mask = _vae_encode(vae, mask_as_img)
-            else:
-                latent_mask = _empty_latent(image_out)
-        else:
-            latent_image = _empty_latent(image_out)
-            latent_mask  = _empty_latent(image_out)
-
-        return (image_out, latent_image, mask_out, latent_mask)
+        return (image_out, mask_out)
 
 
 # ---------------------------------------------------------------------------
@@ -305,9 +259,9 @@ class ImageScaleTotalPixels:
 # ---------------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
-    "ImageScaleTotalPixels": ImageScaleTotalPixels,
+    "ImageScaleToNormPixels": ImageScaleToNormPixels,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ImageScaleTotalPixels": "ImageScaleToTotalPixels",
+    "ImageScaleToNormPixels": "ImageScaleToNormPixels",
 }

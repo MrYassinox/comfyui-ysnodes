@@ -3,21 +3,21 @@ nodes/size_picker.py
 ========================
 Size Picker — converted from the "Size Picker" subgraph.
 
-Logic summary
--------------
-- Base width/height are computed from aspect_ratio + megapixels + multiple,
-  using the same formula as ComfyUI core's ResolutionSelector:
-      total_pixels = megapixels * 1024 * 1024
-      scale        = sqrt(total_pixels / (w_ratio * h_ratio))
-      width        = round(w_ratio * scale / multiple) * multiple
-      height       = round(h_ratio * scale / multiple) * multiple
-- Two parallel paths share that same base:
-    • preset path (on_false): base + user width/height overrides
-    • image path  (on_true):  base + image pixel dims as overrides
-- Switch reads use_image_size:
-    • False → preset path
-    • True  → image path (falls back to preset path if no image connected)
-- The latent is switched independently, just like width and height.
+Two independent modes, selected by use_image_size
+----------------------------------------------------
+  use_image_size=False:
+    width/height computed from aspect_ratio + megapixels + multiple
+    (same formula as ComfyUI core's ResolutionSelector)
+
+  use_image_size=True (image connected):
+    fit_megapixels=False → image's exact pixel size, unchanged
+    fit_megapixels=True  → image's own aspect ratio, resized to hit
+                            the megapixels target (multiple still applies)
+
+In both modes, width_override / height_override (if > 0) always win over
+the computed value, snapped to `multiple`. When no override is set, the
+computed/exact value passes through with NO extra snapping — this matters
+for fit_megapixels=False, where the image's exact pixels must stay exact.
 
 Zero dependency on ComfyUI-nhknodes or any other external pack.
 """
@@ -75,17 +75,37 @@ _DEFAULT_ASPECT_RATIO = AspectRatio.SQUARE.value
 
 
 # ---------------------------------------------------------------------------
-# Helper – compute base (width, height) from aspect_ratio + megapixels
+# Latent type registry — channels + spatial divisor per model architecture
+# ---------------------------------------------------------------------------
+
+LATENT_TYPES: dict[str, tuple[int, int]] = {
+    "SD / SDXL":      (4,   8),   # SD 1.x, SD 2.x, SDXL
+    "SD3 / AuraFlow": (16,  8),   # Stable Diffusion 3, AuraFlow
+    "Flux":           (16,  8),   # Flux (standard)
+    "Flux2":          (128, 16),  # Flux 2 (packed)
+}
+
+_LATENT_TYPE_KEYS    = list(LATENT_TYPES.keys())
+_DEFAULT_LATENT_TYPE = "SD / SDXL"
+
+
+# ---------------------------------------------------------------------------
+# Helper – compute (width, height) from any w_ratio:h_ratio + megapixels
 # (same formula as ComfyUI core ResolutionSelector)
 # ---------------------------------------------------------------------------
 
-def _calculate_base_size(aspect_ratio: str, megapixels: float, multiple: int) -> tuple[int, int]:
-    w_ratio, h_ratio = ASPECT_RATIOS[aspect_ratio]
+def _calculate_size_from_ratio(w_ratio: float, h_ratio: float, megapixels: float, multiple: int) -> tuple[int, int]:
     total_pixels = megapixels * 1024 * 1024
     scale = math.sqrt(total_pixels / (w_ratio * h_ratio))
     width = round(w_ratio * scale / multiple) * multiple
     height = round(h_ratio * scale / multiple) * multiple
     return width, height
+
+
+def _calculate_base_size(aspect_ratio: str, megapixels: float, multiple: int) -> tuple[int, int]:
+    """Computed base for the aspect_ratio dropdown path."""
+    w_ratio, h_ratio = ASPECT_RATIOS[aspect_ratio]
+    return _calculate_size_from_ratio(w_ratio, h_ratio, megapixels, multiple)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +119,7 @@ def _image_size(image) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Helper – apply width/height overrides, snapped to `multiple`
+# Helper – apply width/height overrides
 # ---------------------------------------------------------------------------
 
 def _apply_overrides(
@@ -111,27 +131,53 @@ def _apply_overrides(
 ) -> tuple[int, int]:
     """
     Override rules:
-      • override == 0  → keep base value
-      • override  > 0  → use override value (snapped to `multiple`)
+      • override == 0  → keep base value EXACTLY as-is (no snapping)
+      • override  > 0  → use override value, snapped to `multiple`
+
+    Not snapping the base when there's no override matters for
+    fit_megapixels=False: the image's exact pixel size must stay exact.
     """
-    w = (width_override  if width_override  > 0 else base_w)
-    h = (height_override if height_override > 0 else base_h)
-    w = max(multiple, (w // multiple) * multiple)
-    h = max(multiple, (h // multiple) * multiple)
+    if width_override > 0:
+        w = max(multiple, (width_override // multiple) * multiple)
+    else:
+        w = base_w
+
+    if height_override > 0:
+        h = max(multiple, (height_override // multiple) * multiple)
+    else:
+        h = base_h
+
     return w, h
 
 
 # ---------------------------------------------------------------------------
-# Helper – build an EmptyLatentImage tensor
+# Helper – build an EmptyLatentImage tensor (dynamic latent type)
 # ---------------------------------------------------------------------------
 
-def _empty_latent(width: int, height: int, batch_size: int) -> dict:
-    """Return a latent dict identical to EmptyLatentImage output."""
+def _empty_latent(width: int, height: int, batch_size: int,
+                  latent_type: str = _DEFAULT_LATENT_TYPE) -> dict:
+    """
+    Return a latent dict matching the spatial format of the given model architecture.
+      SD / SDXL      → 4ch,   pixels ÷  8
+      SD3 / AuraFlow → 16ch,  pixels ÷  8
+      Flux           → 16ch,  pixels ÷  8
+      Flux2          → 128ch, pixels ÷ 16
+    """
+    channels, divisor = LATENT_TYPES[latent_type]
     latent = torch.zeros(
-        [batch_size, 4, height // 8, width // 8],
+        [batch_size, channels, height // divisor, width // divisor],
         dtype=torch.float32,
     )
     return {"samples": latent}
+
+
+# ---------------------------------------------------------------------------
+# Helper – build a blank IMAGE tensor (fallback when no image is connected)
+# ---------------------------------------------------------------------------
+
+def _empty_image(width: int, height: int, batch_size: int) -> torch.Tensor:
+    """Return a blank black IMAGE tensor (B, H, W, C) at the given size."""
+    return torch.zeros([batch_size, height, width, 3], dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -142,30 +188,60 @@ class SizePicker:
     """
     Size Picker
 
-    Computes width/height from an aspect ratio + target megapixels + a
-    rounding multiple (same formula as ComfyUI core's ResolutionSelector),
-    then optionally switches to the connected image's own dimensions.
+    use_image_size=False:
+        width/height = aspect_ratio + megapixels + multiple (computed)
 
-    width_override / height_override non-zero values always win over the
-    computed base, snapped to `multiple`.
+    use_image_size=True (image connected):
+        fit_megapixels=False → image's exact pixel size, unchanged
+        fit_megapixels=True  → image's own aspect ratio, resized to hit
+                                the megapixels target
+
+    width_override / height_override always win over the computed value
+    when > 0 (snapped to multiple). aspect_ratio is ignored whenever
+    use_image_size=True.
 
     Zero dependency on ComfyUI-nhknodes or any other external pack.
     """
 
     CATEGORY = "YSNodes/utility"
     FUNCTION = "pick"
-    RETURN_TYPES = ("INT", "INT", "INT", "LATENT")
-    RETURN_NAMES = ("width", "height", "batch", "latent")
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "LATENT")
+    RETURN_NAMES = ("image", "width", "height", "batch", "latent")
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "use_image_size": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "When True, width/height are taken from the "
+                            "connected image instead of aspect_ratio + megapixels."
+                        ),
+                    },
+                ),
+                "fit_megapixels": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Only applies when use_image_size=True.\n"
+                            "False → use the image's exact pixel size, unchanged.\n"
+                            "True  → keep the image's aspect ratio but resize it "
+                            "to hit the megapixels target below."
+                        ),
+                    },
+                ),
                 "aspect_ratio": (
                     _ASPECT_RATIO_KEYS,
                     {
                         "default": _DEFAULT_ASPECT_RATIO,
-                        "tooltip": "The aspect ratio used to compute width and height.",
+                        "tooltip": (
+                            "The aspect ratio used to compute width and height. "
+                            "Ignored when use_image_size=True."
+                        ),
                     },
                 ),
                 "megapixels": (
@@ -176,8 +252,8 @@ class SizePicker:
                         "max": 16.0,
                         "step": 0.1,
                         "tooltip": (
-                            "Target total megapixels. "
-                            "1.0 MP ≈ 1024×1024 for a square aspect ratio."
+                            "Target total megapixels. Used for the aspect_ratio path, "
+                            "and for the image path when fit_megapixels=True."
                         ),
                     },
                 ),
@@ -201,10 +277,7 @@ class SizePicker:
                         "min": 0,
                         "max": 8192,
                         "step": 8,
-                        "tooltip": (
-                            "Override width in pixels. 0 = use the value computed "
-                            "from aspect_ratio + megapixels."
-                        ),
+                        "tooltip": "Override width in pixels. 0 = use the computed value.",
                     },
                 ),
                 "height_override": (
@@ -214,23 +287,23 @@ class SizePicker:
                         "min": 0,
                         "max": 8192,
                         "step": 8,
-                        "tooltip": (
-                            "Override height in pixels. 0 = use the value computed "
-                            "from aspect_ratio + megapixels."
-                        ),
+                        "tooltip": "Override height in pixels. 0 = use the computed value.",
                     },
                 ),
                 "batch_size": (
                     "INT",
                     {"default": 1, "min": 1, "max": 4096, "step": 1},
                 ),
-                "use_image_size": (
-                    "BOOLEAN",
+                "latent_type": (
+                    _LATENT_TYPE_KEYS,
                     {
-                        "default": False,
+                        "default": _DEFAULT_LATENT_TYPE,
                         "tooltip": (
-                            "When True, width/height are taken from the "
-                            "connected image instead of the computed value."
+                            "Latent format matching your model architecture.\n"
+                            "SD / SDXL      → 4ch,   pixels ÷  8\n"
+                            "SD3 / AuraFlow → 16ch,  pixels ÷  8\n"
+                            "Flux           → 16ch,  pixels ÷  8\n"
+                            "Flux2          → 128ch, pixels ÷ 16"
                         ),
                     },
                 ),
@@ -243,46 +316,56 @@ class SizePicker:
     # ------------------------------------------------------------------
     def pick(
         self,
+        use_image_size: bool,
+        fit_megapixels: bool,
         aspect_ratio: str,
         megapixels: float,
         multiple: int,
         width_override: int,
         height_override: int,
         batch_size: int,
-        use_image_size: bool,
+        latent_type: str,
         image=None,
     ):
-        # Shared base — computed from aspect_ratio + megapixels + multiple
+        # ── Computed path (aspect_ratio + megapixels + multiple) ────────
         base_w, base_h = _calculate_base_size(aspect_ratio, megapixels, multiple)
-
-        # ── Computed path → on_false of all switches ────────────────────
         preset_w, preset_h = _apply_overrides(
             base_w, base_h, width_override, height_override, multiple
         )
-        preset_latent = _empty_latent(preset_w, preset_h, batch_size)
+        preset_latent = _empty_latent(preset_w, preset_h, batch_size, latent_type)
 
-        # ── Image path → on_true of all switches ────────────────────────
-        # Image pixel dims feed in as overrides on top of the same base.
-        # Falls back silently to the computed path when no image is connected.
+        # ── Image path ────────────────────────────────────────────────
         if image is not None:
             img_w, img_h = _image_size(image)
+
+            if fit_megapixels:
+                fitted_w, fitted_h = _calculate_size_from_ratio(
+                    img_w, img_h, megapixels, multiple
+                )
+            else:
+                fitted_w, fitted_h = img_w, img_h
+
             image_w, image_h = _apply_overrides(
-                base_w, base_h, img_w, img_h, multiple
+                fitted_w, fitted_h, width_override, height_override, multiple
             )
-            image_latent = _empty_latent(image_w, image_h, batch_size)
+            image_latent = _empty_latent(image_w, image_h, batch_size, latent_type)
         else:
             image_w, image_h = preset_w, preset_h
             image_latent = preset_latent
 
-        # ── Switch — width / height / latent ────────────────────────────
-        # use_image_size=False → computed path
-        # use_image_size=True  → image path
+        # ── Switch ────────────────────────────────────────────────────
         if use_image_size and image is not None:
             out_w, out_h, out_latent = image_w, image_h, image_latent
         else:
             out_w, out_h, out_latent = preset_w, preset_h, preset_latent
 
-        return (out_w, out_h, batch_size, out_latent)
+        # ── image output: passthrough unchanged, or blank placeholder ───
+        if image is not None:
+            image_out = image
+        else:
+            image_out = _empty_image(out_w, out_h, batch_size)
+
+        return (image_out, out_w, out_h, batch_size, out_latent)
 
 
 # ---------------------------------------------------------------------------
